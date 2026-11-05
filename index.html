@@ -19,6 +19,8 @@
     {type: "cards", columns: 6, items: [{label, value, caption, color: "#2563EB", tint: true}]}
     {type: "table", title, subtitle, columns: ["Name", ...] or [{label, key, align: "left"|"right"}], rows: [{...}] or [[...]], note, empty}
     {type: "chart", title, subtitle, src: "https://trescivil.github.io/...", height: 300, note}
+    {type: "image", title, subtitle, src: "data:image/svg+xml,...", height: 300, note}   chart the app draws as an SVG image
+    table rows may also be {cells: [...]}, matched to columns by position
     {type: "text",  title, text}
     {type: "row",   widths: [1, 1], items: [section, ...]}     side-by-side sections
 -->
@@ -167,7 +169,7 @@
       rows.forEach(function (r) {
         var tr = el("tr");
         cols.forEach(function (c, i) {
-          var v = Array.isArray(r) ? r[i] : r[c.key];
+          var v = Array.isArray(r) ? r[i] : Array.isArray(r.cells) ? r.cells[i] : r[c.key];
           tr.appendChild(el("td", c.align === "right" ? "r" : "", v));
         });
         tb.appendChild(tr);
@@ -204,6 +206,33 @@
     return wrap;
   }
 
+  // Images: SVG drawn by the app (data:image/svg+xml) or a picture on an allowed chart host.
+  function renderImage(s) {
+    var wrap = el("div", "sec");
+    var p = panel(s);
+    var src = String(s.src || "");
+    var ok = /^data:image\/svg\+xml[;,]/.test(src);
+    if (!ok) {
+      try { var u = new URL(src); ok = u.protocol === "https:" && ALLOWED_CHART_HOSTS.indexOf(u.hostname) >= 0; } catch (e) { ok = false; }
+    }
+    if (!ok) {
+      p.appendChild(el("div", "empty", "Chart not shown: its image could not be read."));
+    } else {
+      var img = el("img", "chart");
+      img.alt = s.title || "Chart";
+      img.style.height = Math.max(80, Number(s.height) || 300) + "px";
+      img.style.objectFit = "contain";
+      pending++;
+      img.addEventListener("load", function () { pending--; checkReady(); });
+      img.addEventListener("error", function () { pending--; checkReady(); });
+      img.src = src;
+      p.appendChild(img);
+    }
+    note(p, s);
+    wrap.appendChild(p);
+    return wrap;
+  }
+
   function renderText(s) {
     var wrap = el("div", "sec");
     var p = panel(s);
@@ -226,6 +255,7 @@
       case "cards": return renderCards(s);
       case "table": return renderTable(s);
       case "chart": return renderChart(s);
+      case "image": return renderImage(s);
       case "text": return renderText(s);
       case "row": return renderRow(s);
       default: return el("div");
