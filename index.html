@@ -1,0 +1,282 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DRFA print snapshot</title>
+<!--
+  DRFA Manager print page.
+  The canvas app opens  index.html#<EncodeUrl(JSON(report))>  in a new tab; the person prints it with Ctrl+P > Save as PDF.
+
+  report = {
+    title, subtitle,                 text
+    meta: [text, ...],               lines under the title (events, filters, refreshed time)
+    orientation: "landscape" | "portrait"   (default landscape)
+    autoPrint: true | false          open the print dialog once everything has loaded (default false)
+    sections: [section, ...]
+  }
+  section types:
+    {type: "cards", columns: 6, items: [{label, value, caption, color: "#2563EB", tint: true}]}
+    {type: "table", title, subtitle, columns: ["Name", ...] or [{label, key, align: "left"|"right"}], rows: [{...}] or [[...]], note, empty}
+    {type: "chart", title, subtitle, src: "https://trescivil.github.io/...", height: 300, note}
+    {type: "text",  title, text}
+    {type: "row",   widths: [1, 1], items: [section, ...]}     side-by-side sections
+-->
+<style>
+  :root {
+    --ink: #111827; --ink2: #374151; --muted: #6B7280; --line: #E5E7EB; --bg: #F9FAFB; --card: #FFFFFF; --blue: #2563EB;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--ink); font-family: Arial, Helvetica, sans-serif; font-size: 12px; }
+  body { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+
+  .bar { position: sticky; top: 0; z-index: 5; display: flex; align-items: center; gap: 12px; padding: 10px 16px; background: #fff; border-bottom: 1px solid var(--line); }
+  .bar .status { flex: 1; color: var(--muted); font-size: 13px; }
+  .bar .status.ready { color: #15803D; font-weight: 700; }
+  .bar button { font: 700 13px Arial, sans-serif; color: #fff; background: var(--blue); border: 0; border-radius: 6px; padding: 8px 14px; cursor: pointer; }
+  .bar button:disabled { opacity: .5; cursor: default; }
+
+  .page { max-width: 1400px; margin: 0 auto; padding: 16px; }
+  header h1 { margin: 0; font-size: 22px; }
+  header .sub { margin-top: 2px; font-size: 13px; color: var(--ink2); }
+  header .meta { margin-top: 6px; font-size: 11px; color: var(--muted); line-height: 16px; }
+
+  .sec { margin-top: 14px; break-inside: avoid; page-break-inside: avoid; }
+  .panel { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; }
+  .panel h2 { margin: 0; font-size: 14px; }
+  .panel .psub { margin-top: 2px; font-size: 11px; color: var(--muted); }
+  .panel .note { margin-top: 6px; font-size: 11px; color: var(--muted); }
+
+  .cards { display: grid; gap: 10px; }
+  .card { position: relative; border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px 10px 16px; background: #fff; overflow: hidden; break-inside: avoid; }
+  .card .strip { position: absolute; left: 0; top: 0; bottom: 0; width: 4px; }
+  .card .lbl { font-size: 11px; font-weight: 700; color: var(--ink2); }
+  .card .val { margin-top: 6px; font-size: 20px; font-weight: 700; }
+  .card .cap { margin-top: 4px; font-size: 10px; color: var(--muted); }
+
+  table { width: 100%; border-collapse: collapse; margin-top: 8px; }
+  th, td { padding: 5px 6px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+  th { font-size: 10px; color: var(--muted); font-weight: 700; }
+  td.r, th.r { text-align: right; }
+  tr { break-inside: avoid; page-break-inside: avoid; }
+  .empty { margin-top: 8px; color: var(--muted); font-style: italic; }
+
+  .chart { width: 100%; border: 0; margin-top: 8px; display: block; background: #fff; }
+
+  .row { display: grid; gap: 14px; }
+  .row > .sec { margin-top: 0; }
+
+  .error { margin: 40px auto; max-width: 640px; padding: 16px; border: 1px solid #FBC8BF; background: #FEF1EF; color: #B9321E; border-radius: 10px; font-size: 14px; }
+
+  @media print {
+    html, body { background: #fff; }
+    .bar { display: none; }
+    .page { max-width: none; padding: 0; }
+  }
+</style>
+<style id="pagesize">@page { size: A4 landscape; margin: 10mm; }</style>
+</head>
+<body>
+<div class="bar">
+  <span class="status" id="status">Loading…</span>
+  <button id="printBtn" type="button" disabled>Print / Save as PDF</button>
+</div>
+<main class="page" id="root"></main>
+
+<script>
+(function () {
+  "use strict";
+
+  // Chart pages may only come from these hosts.
+  var ALLOWED_CHART_HOSTS = ["trescivil.github.io"];
+
+  var root = document.getElementById("root");
+  var statusEl = document.getElementById("status");
+  var printBtn = document.getElementById("printBtn");
+  var pending = 0;
+  var report;
+
+  function el(tag, cls, text) {
+    var e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text !== undefined && text !== null && text !== "") e.textContent = String(text);
+    return e;
+  }
+
+  function safeColor(c, fallback) {
+    return /^#[0-9a-fA-F]{3,8}$/.test(c || "") ? c : fallback;
+  }
+
+  // Light tint of a hex colour, for card fills (about 6% colour on white, as in the mock-up).
+  function tint(hex, amount) {
+    var h = hex.replace("#", "");
+    if (h.length === 3) h = h.split("").map(function (x) { return x + x; }).join("");
+    var n = parseInt(h.slice(0, 6), 16), r = n >> 16 & 255, g = n >> 8 & 255, b = n & 255;
+    function mix(v) { return Math.round(255 - (255 - v) * amount); }
+    return "rgb(" + mix(r) + "," + mix(g) + "," + mix(b) + ")";
+  }
+
+  function panel(s) {
+    var p = el("div", "panel");
+    if (s.title) p.appendChild(el("h2", "", s.title));
+    if (s.subtitle) p.appendChild(el("div", "psub", s.subtitle));
+    return p;
+  }
+
+  function note(p, s) {
+    if (s.note) p.appendChild(el("div", "note", s.note));
+  }
+
+  function renderCards(s) {
+    var wrap = el("div", "sec");
+    var grid = el("div", "cards");
+    var cols = Math.max(1, Math.min(8, Number(s.columns) || 4));
+    grid.style.gridTemplateColumns = "repeat(" + cols + ", minmax(0, 1fr))";
+    (s.items || []).forEach(function (it) {
+      var c = el("div", "card");
+      var color = safeColor(it.color, "#2563EB");
+      var strip = el("div", "strip");
+      strip.style.background = color;
+      c.appendChild(strip);
+      if (it.tint) { c.style.background = tint(color, 0.06); c.style.borderColor = tint(color, 0.28); }
+      c.appendChild(el("div", "lbl", it.label));
+      var v = el("div", "val", it.value);
+      if (it.valueColor) v.style.color = safeColor(it.valueColor, "");
+      c.appendChild(v);
+      if (it.caption) c.appendChild(el("div", "cap", it.caption));
+      grid.appendChild(c);
+    });
+    wrap.appendChild(grid);
+    return wrap;
+  }
+
+  function renderTable(s) {
+    var wrap = el("div", "sec");
+    var p = panel(s);
+    var cols = (s.columns || []).map(function (c) {
+      return typeof c === "string" ? { label: c, key: c } : { label: c.label || c.key, key: c.key || c.label, align: c.align };
+    });
+    var rows = s.rows || [];
+    if (!rows.length) {
+      p.appendChild(el("div", "empty", s.empty || "Nothing to show"));
+    } else {
+      var t = el("table"), thead = el("thead"), hr = el("tr");
+      cols.forEach(function (c) { hr.appendChild(el("th", c.align === "right" ? "r" : "", c.label)); });
+      thead.appendChild(hr); t.appendChild(thead);
+      var tb = el("tbody");
+      rows.forEach(function (r) {
+        var tr = el("tr");
+        cols.forEach(function (c, i) {
+          var v = Array.isArray(r) ? r[i] : r[c.key];
+          tr.appendChild(el("td", c.align === "right" ? "r" : "", v));
+        });
+        tb.appendChild(tr);
+      });
+      t.appendChild(tb); p.appendChild(t);
+    }
+    note(p, s);
+    wrap.appendChild(p);
+    return wrap;
+  }
+
+  function renderChart(s) {
+    var wrap = el("div", "sec");
+    var p = panel(s);
+    var ok = false;
+    try {
+      var u = new URL(s.src);
+      ok = u.protocol === "https:" && ALLOWED_CHART_HOSTS.indexOf(u.hostname) >= 0;
+    } catch (e) { ok = false; }
+    if (!ok) {
+      p.appendChild(el("div", "empty", "Chart not shown: its address is not one of the DRFA chart pages."));
+    } else {
+      var f = el("iframe", "chart");
+      f.title = s.title || "Chart";
+      f.style.height = Math.max(80, Number(s.height) || 300) + "px";
+      f.setAttribute("loading", "eager");
+      pending++;
+      f.addEventListener("load", function () { pending--; checkReady(); });
+      f.src = s.src;
+      p.appendChild(f);
+    }
+    note(p, s);
+    wrap.appendChild(p);
+    return wrap;
+  }
+
+  function renderText(s) {
+    var wrap = el("div", "sec");
+    var p = panel(s);
+    if (s.text) { var d = el("div", "", s.text); d.style.marginTop = "6px"; d.style.whiteSpace = "pre-wrap"; p.appendChild(d); }
+    wrap.appendChild(p);
+    return wrap;
+  }
+
+  function renderRow(s) {
+    var wrap = el("div", "sec row");
+    var items = s.items || [];
+    var widths = items.map(function (_, i) { return Math.max(0.1, Number((s.widths || [])[i]) || 1); });
+    wrap.style.gridTemplateColumns = widths.map(function (w) { return "minmax(0, " + w + "fr)"; }).join(" ");
+    items.forEach(function (it) { wrap.appendChild(render(it)); });
+    return wrap;
+  }
+
+  function render(s) {
+    switch ((s && s.type) || "") {
+      case "cards": return renderCards(s);
+      case "table": return renderTable(s);
+      case "chart": return renderChart(s);
+      case "text": return renderText(s);
+      case "row": return renderRow(s);
+      default: return el("div");
+    }
+  }
+
+  var readyTimer = null;
+  function checkReady() {
+    if (pending > 0) { statusEl.textContent = "Loading charts… (" + pending + " to go)"; return; }
+    // Give the charts a moment to finish drawing after their pages load.
+    clearTimeout(readyTimer);
+    readyTimer = setTimeout(function () {
+      statusEl.textContent = "Ready to print. Press Ctrl+P (or the button) and choose Save as PDF.";
+      statusEl.className = "status ready";
+      printBtn.disabled = false;
+      if (report && report.autoPrint) window.print();
+    }, 1200);
+  }
+
+  function showError(msg) {
+    root.innerHTML = "";
+    root.appendChild(el("div", "error", msg));
+    statusEl.textContent = "Nothing to print";
+  }
+
+  printBtn.addEventListener("click", function () { window.print(); });
+
+  var raw = location.hash.slice(1);
+  if (!raw) { showError("This page is opened from the DRFA Manager app (PDF snapshot button). It has no report to show on its own."); return; }
+  try {
+    report = JSON.parse(decodeURIComponent(raw));
+  } catch (e) {
+    showError("The report data in this link could not be read. Go back to the app and click PDF snapshot again.");
+    return;
+  }
+
+  if (report.title) document.title = report.title + " – DRFA snapshot";
+  if (report.orientation === "portrait") document.getElementById("pagesize").textContent = "@page { size: A4 portrait; margin: 10mm; }";
+
+  var head = el("header");
+  head.appendChild(el("h1", "", report.title || "DRFA snapshot"));
+  if (report.subtitle) head.appendChild(el("div", "sub", report.subtitle));
+  if (report.meta && report.meta.length) {
+    var m = el("div", "meta");
+    report.meta.forEach(function (line) { m.appendChild(el("div", "", line)); });
+    head.appendChild(m);
+  }
+  root.appendChild(head);
+  (report.sections || []).forEach(function (s) { root.appendChild(render(s)); });
+  checkReady();
+})();
+</script>
+</body>
+</html>
